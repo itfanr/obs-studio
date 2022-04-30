@@ -59,11 +59,6 @@ bool GetDataFilePath(const char *data, string &output)
 	return check_path(data, OBS_DATA_PATH "/obs-studio/", output);
 }
 
-bool InitApplicationBundle()
-{
-	return true;
-}
-
 string GetDefaultVideoSavePath()
 {
 	wchar_t path_utf16[MAX_PATH];
@@ -162,6 +157,20 @@ uint32_t GetWindowsVersion()
 	return ver;
 }
 
+uint32_t GetWindowsBuild()
+{
+	static uint32_t build = 0;
+
+	if (build == 0) {
+		struct win_version_info ver_info;
+
+		get_win_ver(&ver_info);
+		build = ver_info.build;
+	}
+
+	return build;
+}
+
 void SetAeroEnabled(bool enable)
 {
 	static HRESULT(WINAPI * func)(UINT) = nullptr;
@@ -229,6 +238,27 @@ void SetWin32DropStyle(QWidget *window)
 	SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style);
 }
 
+bool SetDisplayAffinitySupported(void)
+{
+	static bool checked = false;
+	static bool supported;
+
+	/* this has to be version gated as setting WDA_EXCLUDEFROMCAPTURE on
+	   older Windows builds behaves like WDA_MONITOR (black box) */
+
+	if (!checked) {
+		if (GetWindowsVersion() > 0x0A00 ||
+		    GetWindowsVersion() == 0x0A00 && GetWindowsBuild() >= 19041)
+			supported = true;
+		else
+			supported = false;
+
+		checked = true;
+	}
+
+	return supported;
+}
+
 bool DisableAudioDucking(bool disable)
 {
 	ComPtr<IMMDeviceEnumerator> devEmum;
@@ -293,7 +323,7 @@ RunOnceMutex &RunOnceMutex::operator=(RunOnceMutex &&rom)
 	return *this;
 }
 
-RunOnceMutex GetRunOnceMutex(bool &already_running)
+RunOnceMutex CheckIfAlreadyRunning(bool &already_running)
 {
 	string name;
 
@@ -413,4 +443,24 @@ QString GetMonitorName(const QString &id)
 	}
 
 	return QString::fromWCharArray(target.monitorFriendlyDeviceName);
+}
+
+/* Based on https://www.winehq.org/pipermail/wine-devel/2008-September/069387.html */
+typedef const char *(CDECL *WINEGETVERSION)(void);
+bool IsRunningOnWine()
+{
+	WINEGETVERSION func;
+	HMODULE nt;
+
+	nt = GetModuleHandleW(L"ntdll");
+	if (!nt)
+		return false;
+
+	func = (WINEGETVERSION)GetProcAddress(nt, "wine_get_version");
+	if (func) {
+		blog(LOG_WARNING, "Running on Wine version \"%s\"", func());
+		return true;
+	}
+
+	return false;
 }

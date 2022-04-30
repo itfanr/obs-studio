@@ -474,6 +474,9 @@
           <property name="orientation">
            <enum>Qt::Vertical</enum>
           </property>
+          <property name="childrenCollapsible">
+           <bool>false</bool>
+          </property>
           <widget class="QFrame" name="previewFrame">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
@@ -575,7 +578,7 @@
           <item>
            <widget class="QDialogButtonBox" name="buttonBox">
             <property name="standardButtons">
-             <set>QDialogButtonBox::Close|QDialogButtonBox::Reset</set>
+             <set>QDialogButtonBox::Close|QDialogButtonBox::RestoreDefaults</set>
             </property>
            </widget>
           </item>

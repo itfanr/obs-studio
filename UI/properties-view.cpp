@@ -26,7 +26,6 @@
 #include "double-slider.hpp"
 #include "slider-ignorewheel.hpp"
 #include "spinbox-ignorewheel.hpp"
-#include "combobox-ignorewheel.hpp"
 #include "qt-wrappers.hpp"
 #include "properties-view.hpp"
 #include "properties-view.moc.hpp"
@@ -89,8 +88,11 @@ Q_DECLARE_METATYPE(media_frames_per_second);
 
 void OBSPropertiesView::ReloadProperties()
 {
-	if (obj) {
-		properties.reset(reloadCallback(obj));
+	if (weakObj || rawObj) {
+		OBSObject strongObj = GetObject();
+		void *obj = strongObj ? strongObj.Get() : rawObj;
+		if (obj)
+			properties.reset(reloadCallback(obj));
 	} else {
 		properties.reset(reloadCallback((void *)type.c_str()));
 		obs_properties_apply_settings(properties.get(), settings);
@@ -174,17 +176,37 @@ void OBSPropertiesView::GetScrollPos(int &h, int &v)
 		v = scroll->value();
 }
 
-OBSPropertiesView::OBSPropertiesView(OBSData settings_, void *obj_,
+OBSPropertiesView::OBSPropertiesView(OBSData settings_, obs_object_t *obj,
 				     PropertiesReloadCallback reloadCallback,
 				     PropertiesUpdateCallback callback_,
-				     PropertiesVisualUpdateCb cb_, int minSize_)
+				     PropertiesVisualUpdateCb visUpdateCb_,
+				     int minSize_)
 	: VScrollArea(nullptr),
 	  properties(nullptr, obs_properties_destroy),
 	  settings(settings_),
-	  obj(obj_),
+	  weakObj(obs_object_get_weak_object(obj)),
 	  reloadCallback(reloadCallback),
 	  callback(callback_),
-	  cb(cb_),
+	  visUpdateCb(visUpdateCb_),
+	  minSize(minSize_)
+{
+	setFrameShape(QFrame::NoFrame);
+	QMetaObject::invokeMethod(this, "ReloadProperties",
+				  Qt::QueuedConnection);
+}
+
+OBSPropertiesView::OBSPropertiesView(OBSData settings_, void *obj,
+				     PropertiesReloadCallback reloadCallback,
+				     PropertiesUpdateCallback callback_,
+				     PropertiesVisualUpdateCb visUpdateCb_,
+				     int minSize_)
+	: VScrollArea(nullptr),
+	  properties(nullptr, obs_properties_destroy),
+	  settings(settings_),
+	  rawObj(obj),
+	  reloadCallback(reloadCallback),
+	  callback(callback_),
+	  visUpdateCb(visUpdateCb_),
 	  minSize(minSize_)
 {
 	setFrameShape(QFrame::NoFrame);
@@ -509,7 +531,7 @@ static string from_obs_data_autoselect(obs_data_t *data, const char *name,
 QWidget *OBSPropertiesView::AddList(obs_property_t *prop, bool &warning)
 {
 	const char *name = obs_property_name(prop);
-	QComboBox *combo = new ComboBoxIgnoreScroll();
+	QComboBox *combo = new QComboBox();
 	obs_combo_type type = obs_property_list_type(prop);
 	obs_combo_format format = obs_property_list_format(prop);
 	size_t count = obs_property_list_item_count(prop);
@@ -949,7 +971,7 @@ CreateSimpleFPSValues(OBSFrameRatePropertyWidget *fpsProps, bool &selected,
 	auto items = vector<common_frame_rate>{};
 	items.reserve(sizeof(common_fps) / sizeof(common_frame_rate));
 
-	auto combo = fpsProps->simpleFPS = new ComboBoxIgnoreScroll{};
+	auto combo = fpsProps->simpleFPS = new QComboBox();
 
 	combo->addItem("", QVariant::fromValue(make_fps(0, 0)));
 	for (const auto &fps : common_fps) {
@@ -1031,7 +1053,7 @@ static QWidget *CreateRationalFPS(OBSFrameRatePropertyWidget *fpsProps,
 	auto str = QTStr("Basic.PropertiesView.FPS.ValidFPSRanges");
 	auto rlabel = new QLabel{str};
 
-	auto combo = fpsProps->fpsRange = new ComboBoxIgnoreScroll{};
+	auto combo = fpsProps->fpsRange = new QComboBox();
 	auto convert_fps = media_frames_per_second_to_fps;
 	//auto convert_fi  = media_frames_per_second_to_frame_interval;
 
@@ -1082,7 +1104,7 @@ CreateFrameRateWidget(obs_property_t *prop, bool &warning, const char *option,
 
 	swap(widget->fps_ranges, fps_ranges);
 
-	auto combo = widget->modeSelect = new ComboBoxIgnoreScroll{};
+	auto combo = widget->modeSelect = new QComboBox();
 	combo->addItem(QTStr("Basic.PropertiesView.FPS.Simple"),
 		       QVariant::fromValue(frame_rate_tag::simple()));
 	combo->addItem(QTStr("Basic.PropertiesView.FPS.Rational"),
@@ -1452,26 +1474,31 @@ void OBSPropertiesView::AddProperty(obs_property_t *property,
 		AddColorAlpha(property, layout, label);
 	}
 
-	if (widget && !obs_property_enabled(property))
-		widget->setEnabled(false);
+	if (!widget && !label)
+		return;
 
 	if (!label && type != OBS_PROPERTY_BOOL &&
 	    type != OBS_PROPERTY_BUTTON && type != OBS_PROPERTY_GROUP)
 		label = new QLabel(QT_UTF8(obs_property_description(property)));
 
-	if (warning && label) //TODO: select color based on background color
-		label->setStyleSheet("QLabel { color: red; }");
+	if (label) {
+		if (warning) //TODO: select color based on background color
+			label->setStyleSheet("QLabel { color: red; }");
 
-	if (label && minSize) {
-		label->setMinimumWidth(minSize);
-		label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		if (minSize) {
+			label->setMinimumWidth(minSize);
+			label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		}
+
+		if (!obs_property_enabled(property))
+			label->setEnabled(false);
 	}
-
-	if (label && !obs_property_enabled(property))
-		label->setEnabled(false);
 
 	if (!widget)
 		return;
+
+	if (!obs_property_enabled(property))
+		widget->setEnabled(false);
 
 	if (obs_property_long_description(property)) {
 		bool lightTheme = palette().text().color().redF() < 0.5;
@@ -1900,9 +1927,13 @@ void WidgetInfo::ButtonClicked()
 		}
 		return;
 	}
-	if (obs_property_button_clicked(property, view->obj)) {
-		QMetaObject::invokeMethod(view, "RefreshProperties",
-					  Qt::QueuedConnection);
+	if (view->rawObj || view->weakObj) {
+		OBSObject strongObj = view->GetObject();
+		void *obj = strongObj ? strongObj.Get() : view->rawObj;
+		if (obs_property_button_clicked(property, obj)) {
+			QMetaObject::invokeMethod(view, "RefreshProperties",
+						  Qt::QueuedConnection);
+		}
 	}
 }
 
@@ -1976,9 +2007,12 @@ void WidgetInfo::ControlChanged()
 		update_timer = new QTimer;
 		connect(update_timer, &QTimer::timeout,
 			[this, &ru = recently_updated]() {
-				if (view->callback && !view->deferUpdate) {
-					view->callback(view->obj,
-						       old_settings_cache,
+				OBSObject strongObj = view->GetObject();
+				void *obj = strongObj ? strongObj.Get()
+						      : view->rawObj;
+				if (obj && view->callback &&
+				    !view->deferUpdate) {
+					view->callback(obj, old_settings_cache,
 						       view->settings);
 				}
 
@@ -1995,8 +2029,12 @@ void WidgetInfo::ControlChanged()
 		blog(LOG_DEBUG, "No update timer or no callback!");
 	}
 
-	if (view->cb && !view->deferUpdate)
-		view->cb(view->obj, view->settings);
+	if (view->visUpdateCb && !view->deferUpdate) {
+		OBSObject strongObj = view->GetObject();
+		void *obj = strongObj ? strongObj.Get() : view->rawObj;
+		if (obj)
+			view->visUpdateCb(obj, view->settings);
+	}
 
 	view->SignalChanged();
 

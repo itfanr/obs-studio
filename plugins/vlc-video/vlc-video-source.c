@@ -420,10 +420,10 @@ static unsigned vlcs_video_format(void **p_data, char *chroma, unsigned *width,
 		c->frame.full_range = new_range;
 		range = c->frame.full_range ? VIDEO_RANGE_FULL
 					    : VIDEO_RANGE_PARTIAL;
-		video_format_get_parameters(VIDEO_CS_DEFAULT, range,
-					    c->frame.color_matrix,
-					    c->frame.color_range_min,
-					    c->frame.color_range_max);
+		video_format_get_parameters_for_format(
+			VIDEO_CS_DEFAULT, range, new_format,
+			c->frame.color_matrix, c->frame.color_range_min,
+			c->frame.color_range_max);
 	}
 
 	while (c->frame.data[i]) {
@@ -460,8 +460,8 @@ static int vlcs_audio_setup(void **p_data, char *format, unsigned *rate,
 	enum audio_format new_audio_format;
 
 	new_audio_format = convert_vlc_audio_format(format);
-	if (*channels > 2)
-		*channels = 2;
+	if (*channels > 8)
+		*channels = 8;
 
 	/* don't free audio data if the data is the same format */
 	if (c->audio.format == new_audio_format &&

@@ -105,6 +105,8 @@ static inline DXGI_FORMAT ConvertGSTextureFormatResource(gs_color_format format)
 		return DXGI_FORMAT_B8G8R8X8_UNORM;
 	case GS_BGRA_UNORM:
 		return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case GS_RG16:
+		return DXGI_FORMAT_R16G16_UNORM;
 	}
 
 	return DXGI_FORMAT_UNKNOWN;
@@ -184,6 +186,8 @@ static inline gs_color_format ConvertDXGITextureFormat(DXGI_FORMAT format)
 		return GS_BGRX_UNORM;
 	case DXGI_FORMAT_B8G8R8A8_UNORM:
 		return GS_BGRA_UNORM;
+	case DXGI_FORMAT_R16G16_UNORM:
+		return GS_RG16;
 	}
 
 	return GS_UNKNOWN;
@@ -511,8 +515,8 @@ struct gs_texture_2d : gs_texture {
 	bool genMipmaps = false;
 	uint32_t sharedHandle = GS_INVALID_HANDLE;
 
-	gs_texture_2d *pairedNV12texture = nullptr;
-	bool nv12 = false;
+	gs_texture_2d *pairedTexture = nullptr;
+	bool twoPlane = false;
 	bool chroma = false;
 	bool acquired = false;
 
@@ -529,8 +533,8 @@ struct gs_texture_2d : gs_texture {
 
 	void RebuildSharedTextureFallback();
 	void Rebuild(ID3D11Device *dev);
-	void RebuildNV12_Y(ID3D11Device *dev);
-	void RebuildNV12_UV(ID3D11Device *dev);
+	void RebuildPaired_Y(ID3D11Device *dev);
+	void RebuildPaired_UV(ID3D11Device *dev);
 
 	inline void Release()
 	{
@@ -550,7 +554,7 @@ struct gs_texture_2d : gs_texture {
 		      gs_color_format colorFormat, uint32_t levels,
 		      const uint8_t *const *data, uint32_t flags,
 		      gs_texture_type type, bool gdiCompatible,
-		      bool nv12 = false);
+		      bool twoPlane = false);
 
 	gs_texture_2d(gs_device_t *device, ID3D11Texture2D *nv12,
 		      uint32_t flags);
@@ -650,7 +654,8 @@ struct gs_stage_surface : gs_obj {
 
 	gs_stage_surface(gs_device_t *device, uint32_t width, uint32_t height,
 			 gs_color_format colorFormat);
-	gs_stage_surface(gs_device_t *device, uint32_t width, uint32_t height);
+	gs_stage_surface(gs_device_t *device, uint32_t width, uint32_t height,
+			 bool p010);
 };
 
 struct gs_sampler_state : gs_obj {
@@ -815,6 +820,7 @@ struct gs_swap_chain : gs_obj {
 	HWND hwnd;
 	gs_init_data initData;
 	DXGI_SWAP_CHAIN_DESC swapDesc = {};
+	gs_color_space space;
 	UINT presentFlags = 0;
 
 	gs_texture_2d target;
@@ -824,7 +830,7 @@ struct gs_swap_chain : gs_obj {
 
 	void InitTarget(uint32_t cx, uint32_t cy);
 	void InitZStencilBuffer(uint32_t cx, uint32_t cy);
-	void Resize(uint32_t cx, uint32_t cy);
+	void Resize(uint32_t cx, uint32_t cy, gs_color_format format);
 	void Init();
 
 	void Rebuild(ID3D11Device *dev);
@@ -981,10 +987,12 @@ struct gs_device {
 	ComPtr<ID3D11DeviceContext> context;
 	uint32_t adpIdx = 0;
 	bool nv12Supported = false;
+	bool p010Supported = false;
 
 	gs_texture_2d *curRenderTarget = nullptr;
 	gs_zstencil_buffer *curZStencilBuffer = nullptr;
 	int curRenderSide = 0;
+	enum gs_color_space curColorSpace = GS_CS_SRGB;
 	bool curFramebufferSrgb = false;
 	bool curFramebufferInvalidate = false;
 	gs_texture *curTextures[GS_MAX_TEXTURES];
@@ -1027,6 +1035,8 @@ struct gs_device {
 
 	vector<gs_device_loss> loss_callbacks;
 	gs_obj *first_obj = nullptr;
+
+	vector<std::pair<HMONITOR, bool>> monitor_to_hdr;
 
 	void InitCompiler();
 	void InitFactory();

@@ -110,7 +110,7 @@ int obs_open_module(obs_module_t **module, const char *path,
 	/* HACK: Do not load obsolete obs-browser build on macOS; the
 	 * obs-browser plugin used to live in the Application Support
 	 * directory. */
-	if (astrstri(path, "Library/Application Support") != NULL &&
+	if (astrstri(path, "Library/Application Support/obs-studio") != NULL &&
 	    astrstri(path, "obs-browser") != NULL) {
 		blog(LOG_WARNING, "Ignoring old obs-browser.so version");
 		return MODULE_ERROR;
@@ -291,7 +291,8 @@ static void load_all_callback(void *param, const struct obs_module_info *info)
 		return;
 	}
 
-	obs_init_module(module);
+	if (!obs_init_module(module))
+		free_module(module);
 
 	UNUSED_PARAMETER(param);
 }
@@ -357,9 +358,17 @@ static bool parse_binary_from_directory(struct dstr *parsed_bin_path,
 
 	dstr_copy_dstr(parsed_bin_path, &directory);
 	dstr_cat(parsed_bin_path, file);
+#ifdef __APPLE__
+	if (!os_file_exists(parsed_bin_path->array)) {
+		dstr_cat(parsed_bin_path, ".so");
+	}
+#else
 	dstr_cat(parsed_bin_path, get_module_extension());
+#endif
 
 	if (!os_file_exists(parsed_bin_path->array)) {
+		/* Legacy fallback: Check for plugin with .so suffix*/
+		dstr_cat(parsed_bin_path, ".so");
 		/* if the file doesn't exist, check with 'lib' prefix */
 		dstr_copy_dstr(parsed_bin_path, &directory);
 		dstr_cat(parsed_bin_path, "lib");
@@ -396,15 +405,15 @@ static void process_found_module(struct obs_module_path *omp, const char *path,
 		return;
 
 	dstr_copy(&name, file);
-	if (!directory) {
-		char *ext = strrchr(name.array, '.');
-		if (ext)
-			dstr_resize(&name, ext - name.array);
+	char *ext = strrchr(name.array, '.');
+	if (ext)
+		dstr_resize(&name, ext - name.array);
 
+	if (!directory) {
 		dstr_copy(&parsed_bin_path, path);
 	} else {
 		bin_found = parse_binary_from_directory(&parsed_bin_path,
-							omp->bin, file);
+							omp->bin, name.array);
 	}
 
 	parsed_data_dir = make_data_directory(name.array, omp->data);
@@ -498,6 +507,16 @@ void free_module(struct obs_module *mod)
 		 * and sometimes this can cause issues. */
 		/* os_dlclose(mod->module); */
 	}
+
+	for (obs_module_t *m = obs->first_module; !!m; m = m->next) {
+		if (m->next == mod) {
+			m->next = mod->next;
+			break;
+		}
+	}
+
+	if (obs->first_module == mod)
+		obs->first_module = mod->next;
 
 	bfree(mod->mod_name);
 	bfree(mod->bin_path);

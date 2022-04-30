@@ -76,6 +76,14 @@ enum gs_color_format {
 	GS_RGBA_UNORM,
 	GS_BGRX_UNORM,
 	GS_BGRA_UNORM,
+	GS_RG16,
+};
+
+enum gs_color_space {
+	GS_CS_SRGB,         /* SDR */
+	GS_CS_SRGB_16F,     /* High-precision SDR */
+	GS_CS_709_EXTENDED, /* Canvas, Mac EDR (HDR) */
+	GS_CS_709_SCRGB,    /* 1.0 = 80 nits, Windows/Linux HDR */
 };
 
 enum gs_zstencil_format {
@@ -460,9 +468,14 @@ EXPORT gs_texrender_t *gs_texrender_create(enum gs_color_format format,
 EXPORT void gs_texrender_destroy(gs_texrender_t *texrender);
 EXPORT bool gs_texrender_begin(gs_texrender_t *texrender, uint32_t cx,
 			       uint32_t cy);
+EXPORT bool gs_texrender_begin_with_color_space(gs_texrender_t *texrender,
+						uint32_t cx, uint32_t cy,
+						enum gs_color_space space);
 EXPORT void gs_texrender_end(gs_texrender_t *texrender);
 EXPORT void gs_texrender_reset(gs_texrender_t *texrender);
 EXPORT gs_texture_t *gs_texrender_get_texture(const gs_texrender_t *texrender);
+EXPORT enum gs_color_format
+gs_texrender_get_format(const gs_texrender_t *texrender);
 
 /* ---------------------------------------------------
  * graphics subsystem
@@ -631,6 +644,7 @@ EXPORT void gs_reset_blend_state(void);
 EXPORT gs_swapchain_t *gs_swapchain_create(const struct gs_init_data *data);
 
 EXPORT void gs_resize(uint32_t x, uint32_t y);
+EXPORT void gs_update_color_space(void);
 EXPORT void gs_get_size(uint32_t *x, uint32_t *y);
 EXPORT uint32_t gs_get_width(void);
 EXPORT uint32_t gs_get_height(void);
@@ -686,10 +700,14 @@ EXPORT void gs_load_default_samplerstate(bool b_3d, int unit);
 EXPORT gs_shader_t *gs_get_vertex_shader(void);
 EXPORT gs_shader_t *gs_get_pixel_shader(void);
 
+EXPORT enum gs_color_space gs_get_color_space(void);
 EXPORT gs_texture_t *gs_get_render_target(void);
 EXPORT gs_zstencil_t *gs_get_zstencil_target(void);
 
 EXPORT void gs_set_render_target(gs_texture_t *tex, gs_zstencil_t *zstencil);
+EXPORT void gs_set_render_target_with_color_space(gs_texture_t *tex,
+						  gs_zstencil_t *zstencil,
+						  enum gs_color_space space);
 EXPORT void gs_set_cube_render_target(gs_texture_t *cubetex, int side,
 				      gs_zstencil_t *zstencil);
 
@@ -832,6 +850,9 @@ EXPORT bool gs_timer_range_get_data(gs_timer_range_t *range, bool *disjoint,
 				    uint64_t *frequency);
 
 EXPORT bool gs_nv12_available(void);
+EXPORT bool gs_p010_available(void);
+
+EXPORT bool gs_is_monitor_hdr(void *monitor);
 
 #define GS_USE_DEBUG_MARKERS 0
 #if GS_USE_DEBUG_MARKERS
@@ -928,14 +949,19 @@ EXPORT int gs_texture_release_sync(gs_texture_t *tex, uint64_t key);
 EXPORT bool gs_texture_create_nv12(gs_texture_t **tex_y, gs_texture_t **tex_uv,
 				   uint32_t width, uint32_t height,
 				   uint32_t flags);
+EXPORT bool gs_texture_create_p010(gs_texture_t **tex_y, gs_texture_t **tex_uv,
+				   uint32_t width, uint32_t height,
+				   uint32_t flags);
 
 EXPORT gs_stagesurf_t *gs_stagesurface_create_nv12(uint32_t width,
+						   uint32_t height);
+EXPORT gs_stagesurf_t *gs_stagesurface_create_p010(uint32_t width,
 						   uint32_t height);
 
 EXPORT void gs_register_loss_callbacks(const struct gs_device_loss *callbacks);
 EXPORT void gs_unregister_loss_callbacks(void *data);
 
-#elif __linux__
+#elif defined(__linux__) || defined(__FreeBSD__)
 
 EXPORT gs_texture_t *gs_texture_create_from_dmabuf(
 	unsigned int width, unsigned int height, uint32_t drm_format,
@@ -963,48 +989,34 @@ EXPORT bool gs_query_dmabuf_modifiers_for_format(uint32_t drm_format,
 static inline uint32_t gs_get_format_bpp(enum gs_color_format format)
 {
 	switch (format) {
+	case GS_DXT1:
+		return 4;
 	case GS_A8:
-		return 8;
 	case GS_R8:
+	case GS_DXT3:
+	case GS_DXT5:
 		return 8;
+	case GS_R16:
+	case GS_R16F:
+	case GS_R8G8:
+		return 16;
 	case GS_RGBA:
-		return 32;
 	case GS_BGRX:
-		return 32;
 	case GS_BGRA:
-		return 32;
 	case GS_R10G10B10A2:
+	case GS_RG16F:
+	case GS_R32F:
+	case GS_RGBA_UNORM:
+	case GS_BGRX_UNORM:
+	case GS_BGRA_UNORM:
+	case GS_RG16:
 		return 32;
 	case GS_RGBA16:
-		return 64;
-	case GS_R16:
-		return 16;
 	case GS_RGBA16F:
+	case GS_RG32F:
 		return 64;
 	case GS_RGBA32F:
 		return 128;
-	case GS_RG16F:
-		return 32;
-	case GS_RG32F:
-		return 64;
-	case GS_R16F:
-		return 16;
-	case GS_R32F:
-		return 32;
-	case GS_DXT1:
-		return 4;
-	case GS_DXT3:
-		return 8;
-	case GS_DXT5:
-		return 8;
-	case GS_R8G8:
-		return 16;
-	case GS_RGBA_UNORM:
-		return 32;
-	case GS_BGRX_UNORM:
-		return 32;
-	case GS_BGRA_UNORM:
-		return 32;
 	case GS_UNKNOWN:
 		return 0;
 	}
@@ -1042,6 +1054,21 @@ gs_generalize_format(enum gs_color_format format)
 	default:
 		return format;
 	}
+}
+
+static inline enum gs_color_format
+gs_get_format_from_space(enum gs_color_space space)
+{
+	switch (space) {
+	case GS_CS_SRGB:
+		break;
+	case GS_CS_SRGB_16F:
+	case GS_CS_709_EXTENDED:
+	case GS_CS_709_SCRGB:
+		return GS_RGBA16F;
+	}
+
+	return GS_RGBA;
 }
 
 static inline uint32_t gs_get_total_levels(uint32_t width, uint32_t height,

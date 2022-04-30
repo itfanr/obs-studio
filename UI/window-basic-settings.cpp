@@ -277,8 +277,9 @@ static void PopulateAACBitrates(initializer_list<QComboBox *> boxes)
 
 	vector<pair<QString, QString>> pairs;
 	for (auto &entry : bitrateMap)
-		pairs.emplace_back(QString::number(entry.first),
-				   obs_encoder_get_display_name(entry.second));
+		pairs.emplace_back(
+			QString::number(entry.first),
+			obs_encoder_get_display_name(entry.second.c_str()));
 
 	for (auto box : boxes) {
 		QString currentText = box->currentText();
@@ -383,6 +384,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->theme, 		     COMBO_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->enableAutoUpdates,    CHECK_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->openStatsOnStartup,   CHECK_CHANGED,  GENERAL_CHANGED);
+	HookWidget(ui->hideOBSFromCapture,   CHECK_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->warnBeforeStreamStart,CHECK_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->warnBeforeStreamStop, CHECK_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->warnBeforeRecordStop, CHECK_CHANGED,  GENERAL_CHANGED);
@@ -457,6 +459,11 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->advOutRecUseRescale,  CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecRescale,     CBEDIT_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutMuxCustom,      EDIT_CHANGED,   OUTPUTS_CHANGED);
+	HookWidget(ui->advOutSplitFile,      CHECK_CHANGED,  OUTPUTS_CHANGED);
+	HookWidget(ui->advOutSplitFileType,  COMBO_CHANGED,  OUTPUTS_CHANGED);
+	HookWidget(ui->advOutSplitFileTime,  SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutSplitFileSize,  SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutSplitFileRstTS, CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecTrack1,      CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecTrack2,      CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecTrack3,      CHECK_CHANGED,  OUTPUTS_CHANGED);
@@ -529,6 +536,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->colorFormat,          COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->colorSpace,           COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->colorRange,           COMBO_CHANGED,  ADV_CHANGED);
+	HookWidget(ui->sdrWhiteLevel,        SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->hdrNominalPeakLevel,  SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->disableOSXVSync,      CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->resetOSXVSync,        CHECK_CHANGED,  ADV_CHANGED);
 	if (obs_audio_monitoring_available())
@@ -589,6 +598,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 #ifdef _WIN32
 	uint32_t winVer = GetWindowsVersion();
 	if (winVer > 0 && winVer < 0x602) {
+		// Older than Windows 8
 		toggleAero = new QCheckBox(
 			QTStr("Basic.Settings.Video.DisableAero"), this);
 		QFormLayout *videoLayout = reinterpret_cast<QFormLayout *>(
@@ -598,6 +608,11 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 		HookWidget(toggleAero, CHECK_CHANGED, VIDEO_CHANGED);
 		connect(toggleAero, &QAbstractButton::toggled, this,
 			&OBSBasicSettings::ToggleDisableAero);
+	}
+
+	if (!SetDisplayAffinitySupported()) {
+		delete ui->hideOBSFromCapture;
+		ui->hideOBSFromCapture = nullptr;
 	}
 
 #define PROCESS_PRIORITY(val)                                                \
@@ -627,11 +642,12 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	delete ui->processPriority;
 	delete ui->enableNewSocketLoop;
 	delete ui->enableLowLatencyMode;
+	delete ui->hideOBSFromCapture;
 #ifdef __linux__
 	delete ui->browserHWAccel;
 	delete ui->sourcesGroup;
 #endif
-#if defined(__APPLE__) || HAVE_PULSEAUDIO
+#if defined(__APPLE__) || defined(PULSEAUDIO_FOUND)
 	delete ui->disableAudioDucking;
 #endif
 	ui->rendererLabel = nullptr;
@@ -642,11 +658,12 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	ui->processPriority = nullptr;
 	ui->enableNewSocketLoop = nullptr;
 	ui->enableLowLatencyMode = nullptr;
+	ui->hideOBSFromCapture = nullptr;
 #ifdef __linux__
 	ui->browserHWAccel = nullptr;
 	ui->sourcesGroup = nullptr;
 #endif
-#if defined(__APPLE__) || HAVE_PULSEAUDIO
+#if defined(__APPLE__) || defined(PULSEAUDIO_FOUND)
 	ui->disableAudioDucking = nullptr;
 #endif
 #endif
@@ -689,6 +706,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	LoadEncoderTypes();
 	LoadColorRanges();
+	LoadColorSpaces();
 	LoadFormats();
 
 	auto ReloadAudioSources = [](void *data, calldata_t *param) {
@@ -769,6 +787,10 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 		this, SLOT(SimpleReplayBufferChanged()));
 	connect(ui->simpleRBSecMax, SIGNAL(valueChanged(int)), this,
 		SLOT(SimpleReplayBufferChanged()));
+	connect(ui->advOutSplitFile, SIGNAL(stateChanged(int)), this,
+		SLOT(AdvOutSplitFileChanged()));
+	connect(ui->advOutSplitFileType, SIGNAL(currentIndexChanged(int)), this,
+		SLOT(AdvOutSplitFileChanged()));
 	connect(ui->advReplayBuf, SIGNAL(toggled(bool)), this,
 		SLOT(AdvReplayBufferChanged()));
 	connect(ui->advOutRecTrack1, SIGNAL(toggled(bool)), this,
@@ -895,6 +917,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	ui->buttonBox->button(QDialogButtonBox::Cancel)->setIcon(QIcon());
 
 	SimpleRecordingQualityChanged();
+	AdvOutSplitFileChanged();
 
 	UpdateAutomaticReplayBufferCheckboxes();
 
@@ -988,7 +1011,9 @@ void OBSBasicSettings::LoadEncoderTypes()
 
 		const char *streaming_codecs[] = {
 			"h264",
-			//"hevc",
+#ifdef ENABLE_HEVC
+			"hevc",
+#endif
 		};
 		bool is_streaming_codec = false;
 		for (const char *test_codec : streaming_codecs) {
@@ -1016,6 +1041,21 @@ void OBSBasicSettings::LoadColorRanges()
 {
 	ui->colorRange->addItem(CS_PARTIAL_STR, "Partial");
 	ui->colorRange->addItem(CS_FULL_STR, "Full");
+}
+
+#define CS_SRGB_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.sRGB")
+#define CS_709_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.709")
+#define CS_601_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.601")
+#define CS_2100PQ_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100PQ")
+#define CS_2100HLG_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100HLG")
+
+void OBSBasicSettings::LoadColorSpaces()
+{
+	ui->colorSpace->addItem(CS_SRGB_STR, "sRGB");
+	ui->colorSpace->addItem(CS_709_STR, "709");
+	ui->colorSpace->addItem(CS_601_STR, "601");
+	ui->colorSpace->addItem(CS_2100PQ_STR, "2100PQ");
+	ui->colorSpace->addItem(CS_2100HLG_STR, "2100HLG");
 }
 
 #define AV_FORMAT_DEFAULT_STR \
@@ -1226,6 +1266,18 @@ void OBSBasicSettings::LoadGeneralSettings()
 						  "OpenStatsOnStartup");
 	ui->openStatsOnStartup->setChecked(openStatsOnStartup);
 
+#if defined(_WIN32)
+	if (ui->hideOBSFromCapture) {
+		bool hideWindowFromCapture =
+			config_get_bool(GetGlobalConfig(), "BasicWindow",
+					"HideOBSWindowsFromCapture");
+		ui->hideOBSFromCapture->setChecked(hideWindowFromCapture);
+
+		connect(ui->hideOBSFromCapture, SIGNAL(stateChanged(int)), this,
+			SLOT(HideOBSWindowWarning(int)));
+	}
+#endif
+
 	bool recordWhenStreaming = config_get_bool(
 		GetGlobalConfig(), "BasicWindow", "RecordWhenStreaming");
 	ui->recordWhenStreaming->setChecked(recordWhenStreaming);
@@ -1366,6 +1418,18 @@ void OBSBasicSettings::LoadGeneralSettings()
 	ui->multiviewLayout->addItem(
 		QTStr("Basic.Settings.General.MultiviewLayout.Horizontal.Extended.Top"),
 		static_cast<int>(MultiviewLayout::HORIZONTAL_TOP_24_SCENES));
+	ui->multiviewLayout->addItem(
+		QTStr("Basic.Settings.General.MultiviewLayout.4Scene"),
+		static_cast<int>(MultiviewLayout::SCENES_ONLY_4_SCENES));
+	ui->multiviewLayout->addItem(
+		QTStr("Basic.Settings.General.MultiviewLayout.9Scene"),
+		static_cast<int>(MultiviewLayout::SCENES_ONLY_9_SCENES));
+	ui->multiviewLayout->addItem(
+		QTStr("Basic.Settings.General.MultiviewLayout.16Scene"),
+		static_cast<int>(MultiviewLayout::SCENES_ONLY_16_SCENES));
+	ui->multiviewLayout->addItem(
+		QTStr("Basic.Settings.General.MultiviewLayout.25Scene"),
+		static_cast<int>(MultiviewLayout::SCENES_ONLY_25_SCENES));
 
 	ui->multiviewLayout->setCurrentIndex(ui->multiviewLayout->findData(
 		QVariant::fromValue(config_get_int(
@@ -1534,30 +1598,42 @@ void OBSBasicSettings::ResetDownscales(uint32_t cx, uint32_t cy,
 
 void OBSBasicSettings::LoadDownscaleFilters()
 {
-	ui->downscaleFilter->addItem(
-		QTStr("Basic.Settings.Video.DownscaleFilter.Bilinear"),
-		QT_UTF8("bilinear"));
-	ui->downscaleFilter->addItem(
-		QTStr("Basic.Settings.Video.DownscaleFilter.Area"),
-		QT_UTF8("area"));
-	ui->downscaleFilter->addItem(
-		QTStr("Basic.Settings.Video.DownscaleFilter.Bicubic"),
-		QT_UTF8("bicubic"));
-	ui->downscaleFilter->addItem(
-		QTStr("Basic.Settings.Video.DownscaleFilter.Lanczos"),
-		QT_UTF8("lanczos"));
+	QString downscaleFilter = ui->downscaleFilter->currentData().toString();
+	if (downscaleFilter.isEmpty())
+		downscaleFilter =
+			config_get_string(main->Config(), "Video", "ScaleType");
 
-	const char *scaleType =
-		config_get_string(main->Config(), "Video", "ScaleType");
+	ui->downscaleFilter->clear();
+	if (ui->baseResolution->currentText() ==
+	    ui->outputResolution->currentText()) {
+		ui->downscaleFilter->setEnabled(false);
+		ui->downscaleFilter->addItem(
+			QTStr("Basic.Settings.Video.DownscaleFilter.Unavailable"),
+			downscaleFilter);
+	} else {
+		ui->downscaleFilter->setEnabled(true);
+		ui->downscaleFilter->addItem(
+			QTStr("Basic.Settings.Video.DownscaleFilter.Bilinear"),
+			QT_UTF8("bilinear"));
+		ui->downscaleFilter->addItem(
+			QTStr("Basic.Settings.Video.DownscaleFilter.Area"),
+			QT_UTF8("area"));
+		ui->downscaleFilter->addItem(
+			QTStr("Basic.Settings.Video.DownscaleFilter.Bicubic"),
+			QT_UTF8("bicubic"));
+		ui->downscaleFilter->addItem(
+			QTStr("Basic.Settings.Video.DownscaleFilter.Lanczos"),
+			QT_UTF8("lanczos"));
 
-	if (astrcmpi(scaleType, "bilinear") == 0)
-		ui->downscaleFilter->setCurrentIndex(0);
-	else if (astrcmpi(scaleType, "lanczos") == 0)
-		ui->downscaleFilter->setCurrentIndex(3);
-	else if (astrcmpi(scaleType, "area") == 0)
-		ui->downscaleFilter->setCurrentIndex(1);
-	else
-		ui->downscaleFilter->setCurrentIndex(2);
+		if (downscaleFilter == "bilinear")
+			ui->downscaleFilter->setCurrentIndex(0);
+		else if (downscaleFilter == "lanczos")
+			ui->downscaleFilter->setCurrentIndex(3);
+		else if (downscaleFilter == "area")
+			ui->downscaleFilter->setCurrentIndex(1);
+		else
+			ui->downscaleFilter->setCurrentIndex(2);
+	}
 }
 
 void OBSBasicSettings::LoadResolutionLists()
@@ -1901,6 +1977,16 @@ void OBSBasicSettings::LoadAdvOutputRecordingSettings()
 		config_get_string(main->Config(), "AdvOut", "RecMuxerCustom");
 	int tracks = config_get_int(main->Config(), "AdvOut", "RecTracks");
 	int flvTrack = config_get_int(main->Config(), "AdvOut", "FLVTrack");
+	bool splitFile =
+		config_get_bool(main->Config(), "AdvOut", "RecSplitFile");
+	const char *splitFileType =
+		config_get_string(main->Config(), "AdvOut", "RecSplitFileType");
+	int splitFileTime =
+		config_get_int(main->Config(), "AdvOut", "RecSplitFileTime");
+	int splitFileSize =
+		config_get_int(main->Config(), "AdvOut", "RecSplitFileSize");
+	bool splitFileResetTimestamps = config_get_bool(
+		main->Config(), "AdvOut", "RecSplitFileResetTimestamps");
 
 	int typeIndex = (astrcmpi(type, "FFmpeg") == 0) ? 1 : 0;
 	ui->advOutRecType->setCurrentIndex(typeIndex);
@@ -1919,6 +2005,13 @@ void OBSBasicSettings::LoadAdvOutputRecordingSettings()
 	ui->advOutRecTrack4->setChecked(tracks & (1 << 3));
 	ui->advOutRecTrack5->setChecked(tracks & (1 << 4));
 	ui->advOutRecTrack6->setChecked(tracks & (1 << 5));
+
+	idx = (astrcmpi(splitFileType, "Size") == 0) ? 1 : 0;
+	ui->advOutSplitFile->setChecked(splitFile);
+	ui->advOutSplitFileType->setCurrentIndex(idx);
+	ui->advOutSplitFileTime->setValue(splitFileTime);
+	ui->advOutSplitFileSize->setValue(splitFileSize);
+	ui->advOutSplitFileRstTS->setChecked(splitFileResetTimestamps);
 
 	switch (flvTrack) {
 	case 1:
@@ -2467,6 +2560,35 @@ void OBSBasicSettings::LoadAudioSettings()
 	loading = false;
 }
 
+void OBSBasicSettings::UpdateColorFormatSpaceWarning()
+{
+	const QString text = ui->colorFormat->currentText();
+	switch (ui->colorSpace->currentIndex()) {
+	case 3: /* Rec.2100 (PQ) */
+	case 4: /* Rec.2100 (HLG) */
+		if (text == "P010") {
+			ui->advancedMsg2->clear();
+		} else if (text == "I010") {
+			ui->advancedMsg2->setText(
+				QTStr("Basic.Settings.Advanced.FormatWarning"));
+		} else {
+			ui->advancedMsg2->setText(QTStr(
+				"Basic.Settings.Advanced.FormatWarning2100"));
+		}
+		break;
+	default:
+		if (text == "NV12") {
+			ui->advancedMsg2->clear();
+		} else if ((text == "I010") || (text == "P010")) {
+			ui->advancedMsg2->setText(QTStr(
+				"Basic.Settings.Advanced.FormatWarning10BitSdr"));
+		} else {
+			ui->advancedMsg2->setText(
+				QTStr("Basic.Settings.Advanced.FormatWarning"));
+		}
+	}
+}
+
 void OBSBasicSettings::LoadAdvancedSettings()
 {
 	const char *videoColorFormat =
@@ -2475,6 +2597,10 @@ void OBSBasicSettings::LoadAdvancedSettings()
 		config_get_string(main->Config(), "Video", "ColorSpace");
 	const char *videoColorRange =
 		config_get_string(main->Config(), "Video", "ColorRange");
+	uint32_t sdrWhiteLevel = (uint32_t)config_get_uint(
+		main->Config(), "Video", "SdrWhiteLevel");
+	uint32_t hdrNominalPeakLevel = (uint32_t)config_get_uint(
+		main->Config(), "Video", "HdrNominalPeakLevel");
 
 	QString monDevName;
 	QString monDevId;
@@ -2543,9 +2669,13 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->autoRemux->setChecked(autoRemux);
 	ui->dynBitrate->setChecked(dynBitrate);
 
+	UpdateColorFormatSpaceWarning();
+
 	SetComboByName(ui->colorFormat, videoColorFormat);
-	SetComboByName(ui->colorSpace, videoColorSpace);
+	SetComboByValue(ui->colorSpace, videoColorSpace);
 	SetComboByValue(ui->colorRange, videoColorRange);
+	ui->sdrWhiteLevel->setValue(sdrWhiteLevel);
+	ui->hdrNominalPeakLevel->setValue(hdrNominalPeakLevel);
 
 	if (!SetComboByValue(ui->bindToIP, bindIP))
 		SetInvalidValue(ui->bindToIP, bindIP, bindIP);
@@ -2975,6 +3105,23 @@ void OBSBasicSettings::SaveGeneralSettings()
 				"EnableAutoUpdates",
 				ui->enableAutoUpdates->isChecked());
 #endif
+#ifdef _WIN32
+	if (ui->hideOBSFromCapture && WidgetChanged(ui->hideOBSFromCapture)) {
+		bool hide_window = ui->hideOBSFromCapture->isChecked();
+		config_set_bool(GetGlobalConfig(), "BasicWindow",
+				"HideOBSWindowsFromCapture", hide_window);
+
+		QWindowList windows = QGuiApplication::allWindows();
+		for (auto window : windows) {
+			if (window->isVisible()) {
+				main->SetDisplayAffinity(window);
+			}
+		}
+
+		blog(LOG_INFO, "Hide OBS windows from screen capture: %s",
+		     hide_window ? "true" : "false");
+	}
+#endif
 	if (WidgetChanged(ui->openStatsOnStartup))
 		config_set_bool(main->Config(), "General", "OpenStatsOnStartup",
 				ui->openStatsOnStartup->isChecked());
@@ -3232,8 +3379,10 @@ void OBSBasicSettings::SaveAdvancedSettings()
 #endif
 
 	SaveCombo(ui->colorFormat, "Video", "ColorFormat");
-	SaveCombo(ui->colorSpace, "Video", "ColorSpace");
+	SaveComboData(ui->colorSpace, "Video", "ColorSpace");
 	SaveComboData(ui->colorRange, "Video", "ColorRange");
+	SaveSpinBox(ui->sdrWhiteLevel, "Video", "SdrWhiteLevel");
+	SaveSpinBox(ui->hdrNominalPeakLevel, "Video", "HdrNominalPeakLevel");
 	if (obs_audio_monitoring_available()) {
 		SaveCombo(ui->monitoringDevice, "Audio",
 			  "MonitoringDeviceName");
@@ -3299,6 +3448,14 @@ static inline const char *RecTypeFromIdx(int idx)
 		return "FFmpeg";
 	else
 		return "Standard";
+}
+
+static inline const char *SplitFileTypeFromIdx(int idx)
+{
+	if (idx == 1)
+		return "Size";
+	else
+		return "Time";
 }
 
 static void WriteJsonData(OBSPropertiesView *view, const char *path)
@@ -3436,6 +3593,14 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveCheckBox(ui->advOutRecUseRescale, "AdvOut", "RecRescale");
 	SaveCombo(ui->advOutRecRescale, "AdvOut", "RecRescaleRes");
 	SaveEdit(ui->advOutMuxCustom, "AdvOut", "RecMuxerCustom");
+	SaveCheckBox(ui->advOutSplitFile, "AdvOut", "RecSplitFile");
+	config_set_string(
+		main->Config(), "AdvOut", "RecSplitFileType",
+		SplitFileTypeFromIdx(ui->advOutSplitFileType->currentIndex()));
+	SaveSpinBox(ui->advOutSplitFileTime, "AdvOut", "RecSplitFileTime");
+	SaveSpinBox(ui->advOutSplitFileSize, "AdvOut", "RecSplitFileSize");
+	SaveCheckBox(ui->advOutSplitFileRstTS, "AdvOut",
+		     "RecSplitFileResetTimestamps");
 
 	config_set_int(
 		main->Config(), "AdvOut", "RecTracks",
@@ -3958,15 +4123,14 @@ void OBSBasicSettings::on_advOutFFType_currentIndexChanged(int idx)
 	ui->advOutFFNoSpace->setHidden(idx != 0);
 }
 
-void OBSBasicSettings::on_colorFormat_currentIndexChanged(const QString &text)
+void OBSBasicSettings::on_colorFormat_currentIndexChanged(const QString &)
 {
-	bool usingNV12 = text == "NV12";
+	UpdateColorFormatSpaceWarning();
+}
 
-	if (usingNV12)
-		ui->advancedMsg2->setText(QString());
-	else
-		ui->advancedMsg2->setText(
-			QTStr("Basic.Settings.Advanced.FormatWarning"));
+void OBSBasicSettings::on_colorSpace_currentIndexChanged(const QString &)
+{
+	UpdateColorFormatSpaceWarning();
 }
 
 #define INVALID_RES_STR "Basic.Settings.Video.InvalidResolution"
@@ -4047,8 +4211,10 @@ void OBSBasicSettings::on_filenameFormatting_textEdited(const QString &text)
 
 void OBSBasicSettings::on_outputResolution_editTextChanged(const QString &text)
 {
-	if (!loading)
+	if (!loading) {
 		RecalcOutputResPixels(QT_TO_UTF8(text));
+		LoadDownscaleFilters();
+	}
 }
 
 void OBSBasicSettings::on_baseResolution_editTextChanged(const QString &text)
@@ -4175,6 +4341,24 @@ void OBSBasicSettings::SpeakerLayoutChanged(int idx)
 		SaveCombo(ui->advOutTrack5Bitrate, "AdvOut", "Track5Bitrate");
 		SaveCombo(ui->advOutTrack6Bitrate, "AdvOut", "Track6Bitrate");
 	}
+}
+
+void OBSBasicSettings::HideOBSWindowWarning(int state)
+{
+	if (loading || state == Qt::Unchecked)
+		return;
+
+	if (config_get_bool(GetGlobalConfig(), "General",
+			    "WarnedAboutHideOBSFromCapture"))
+		return;
+
+	OBSMessageBox::information(
+		this, QTStr("Basic.Settings.General.HideOBSWindowsFromCapture"),
+		QTStr("Basic.Settings.General.HideOBSWindowsFromCapture.Message"));
+
+	config_set_bool(GetGlobalConfig(), "General",
+			"WarnedAboutHideOBSFromCapture", true);
+	config_save_safe(GetGlobalConfig(), "tmp", nullptr);
 }
 
 /*
@@ -4408,6 +4592,20 @@ void OBSBasicSettings::AdvancedChanged()
 		sender()->setProperty("changed", QVariant(true));
 		EnableApplyButton(true);
 	}
+}
+
+void OBSBasicSettings::AdvOutSplitFileChanged()
+{
+	bool splitFile = ui->advOutSplitFile->isChecked();
+	int splitFileType = splitFile ? ui->advOutSplitFileType->currentIndex()
+				      : -1;
+
+	ui->advOutSplitFileType->setEnabled(splitFile);
+	ui->advOutSplitFileTimeLabel->setVisible(splitFileType == 0);
+	ui->advOutSplitFileTime->setVisible(splitFileType == 0);
+	ui->advOutSplitFileSizeLabel->setVisible(splitFileType == 1);
+	ui->advOutSplitFileSize->setVisible(splitFileType == 1);
+	ui->advOutSplitFileRstTS->setVisible(splitFile);
 }
 
 void OBSBasicSettings::AdvOutRecCheckWarnings()

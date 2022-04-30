@@ -1,6 +1,5 @@
 #include "obs-module.h"
 #include "scripts.hpp"
-#include "frontend-tools-config.h"
 #include "../../properties-view.hpp"
 #include "../../qt-wrappers.hpp"
 
@@ -33,7 +32,7 @@
 
 #include "ui_scripts.h"
 
-#if COMPILE_PYTHON && (defined(_WIN32) || defined(__APPLE__))
+#if defined(Python_FOUND) && (defined(_WIN32) || defined(__APPLE__))
 #define PYTHON_UI 1
 #else
 #define PYTHON_UI 0
@@ -49,7 +48,7 @@
 
 /* ----------------------------------------------------------------- */
 
-using OBSScript = OBSObj<obs_script_t *, obs_script_destroy>;
+using OBSScript = OBSPtr<obs_script_t *, obs_script_destroy>;
 
 struct ScriptData {
 	std::vector<OBSScript> scripts;
@@ -218,8 +217,6 @@ ScriptsTool::~ScriptsTool()
 	config_t *global_config = obs_frontend_get_global_config();
 	config_set_int(global_config, "scripts-tool", "prevScriptRow",
 		       ui->scripts->currentRow());
-
-	delete ui;
 }
 
 void ScriptsTool::RemoveScript(const char *path)

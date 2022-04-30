@@ -197,9 +197,24 @@ General Scene Functions
 ---------------------
 
 .. function:: void obs_scene_addref(obs_scene_t *scene)
-              void obs_scene_release(obs_scene_t *scene)
 
-   Adds/releases a reference to a scene.
+   Adds a reference to a scene.
+
+.. deprecated:: 27.2.0
+   Use :c:func:`obs_scene_get_ref()` instead.
+
+---------------------
+
+.. function:: obs_scene_t *obs_scene_get_ref(obs_scene_t *scene)
+
+   Returns an incremented reference if still valid, otherwise returns
+   *NULL*.
+
+---------------------
+
+.. function:: void obs_scene_release(obs_scene_t *scene)
+
+   Releases a reference to a scene.
 
 ---------------------
 
@@ -489,6 +504,17 @@ Scene Item Functions
                   | OBS_SCALE_BICUBIC
                   | OBS_SCALE_BILINEAR
                   | OBS_SCALE_LANCZOS
+
+---------------------
+
+.. function:: void obs_sceneitem_set_blending_method(obs_sceneitem_t *item, enum obs_blending_method method)
+              enum obs_blending_method obs_sceneitem_get_blending_method(obs_sceneitem_t *item)
+
+   Sets/gets the blending method used for the scene item.
+
+   :param method: | Can be one of the following values:
+                  | OBS_BLEND_METHOD_DEFAULT
+                  | OBS_BLEND_METHOD_SRGB_OFF
 
 ---------------------
 

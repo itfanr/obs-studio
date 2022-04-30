@@ -535,7 +535,8 @@ static void volmeter_source_data_received(void *vptr, obs_source_t *source,
 
 	// Adjust magnitude/peak based on the volume level set by the user.
 	// And convert to dB.
-	mul = db_to_mul(volmeter->cur_db);
+	mul = muted && !obs_source_muted(source) ? 0.0f
+						 : db_to_mul(volmeter->cur_db);
 	for (int channel_nr = 0; channel_nr < MAX_AUDIO_CHANNELS;
 	     channel_nr++) {
 		magnitude[channel_nr] =
@@ -552,7 +553,6 @@ static void volmeter_source_data_received(void *vptr, obs_source_t *source,
 	signal_levels_updated(volmeter, magnitude, peak, input_peak);
 
 	UNUSED_PARAMETER(source);
-	UNUSED_PARAMETER(muted);
 }
 
 obs_fader_t *obs_fader_create(enum obs_fader_type type)
@@ -897,7 +897,7 @@ int obs_volmeter_get_nr_channels(obs_volmeter_t *volmeter)
 		source_nr_audio_channels = get_audio_channels(
 			volmeter->source->sample_info.speakers);
 	} else {
-		source_nr_audio_channels = 1;
+		source_nr_audio_channels = 0;
 	}
 
 	struct obs_audio_info audio_info;
@@ -907,7 +907,7 @@ int obs_volmeter_get_nr_channels(obs_volmeter_t *volmeter)
 		obs_nr_audio_channels = 2;
 	}
 
-	return CLAMP(source_nr_audio_channels, 1, obs_nr_audio_channels);
+	return CLAMP(source_nr_audio_channels, 0, obs_nr_audio_channels);
 }
 
 void obs_volmeter_add_callback(obs_volmeter_t *volmeter,

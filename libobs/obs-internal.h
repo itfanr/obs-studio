@@ -204,9 +204,10 @@ extern void obs_view_free(struct obs_view *view);
 /* displays */
 
 struct obs_display {
-	bool size_changed;
+	bool update_color_space;
 	bool enabled;
 	uint32_t cx, cy;
+	uint32_t next_cx, next_cy;
 	uint32_t background_color;
 	gs_swapchain_t *swap;
 	pthread_mutex_t draw_callbacks_mutex;
@@ -246,14 +247,21 @@ struct obs_task_info {
 
 struct obs_core_video {
 	graphics_t *graphics;
+	gs_stagesurf_t *active_copy_surfaces[NUM_TEXTURES][NUM_CHANNELS];
 	gs_stagesurf_t *copy_surfaces[NUM_TEXTURES][NUM_CHANNELS];
+	gs_texture_t *convert_textures[NUM_CHANNELS];
+#ifdef _WIN32
+	gs_stagesurf_t *copy_surfaces_encode[NUM_TEXTURES];
+	gs_texture_t *convert_textures_encode[NUM_CHANNELS];
+#endif
 	gs_texture_t *render_texture;
 	gs_texture_t *output_texture;
-	gs_texture_t *convert_textures[NUM_CHANNELS];
+	enum gs_color_space render_space;
 	bool texture_rendered;
 	bool textures_copied[NUM_TEXTURES];
 	bool texture_converted;
 	bool using_nv12_tex;
+	bool using_p010_tex;
 	struct circlebuf vframe_info_buffer;
 	struct circlebuf vframe_info_buffer_gpu;
 	gs_effect_t *default_effect;
@@ -296,6 +304,7 @@ struct obs_core_video {
 	const char *conversion_techs[NUM_CHANNELS];
 	bool conversion_needed;
 	float conversion_width_i;
+	float conversion_height_i;
 
 	uint32_t output_width;
 	uint32_t output_height;
@@ -316,6 +325,8 @@ struct obs_core_video {
 	gs_effect_t *deinterlace_yadif_2x_effect;
 
 	struct obs_video_info ovi;
+	float sdr_white_level;
+	float hdr_nominal_peak_level;
 
 	pthread_mutex_t task_mutex;
 	struct circlebuf tasks;
@@ -333,6 +344,8 @@ struct obs_core_audio {
 	struct circlebuf buffered_timestamps;
 	uint64_t buffering_wait_ticks;
 	int total_buffering_ticks;
+	int max_buffering_ticks;
+	bool fixed_buffer;
 
 	float user_volume;
 
@@ -484,6 +497,18 @@ extern void stop_raw_video(video_t *video,
 /* ------------------------------------------------------------------------- */
 /* obs shared context data */
 
+struct obs_weak_ref {
+	volatile long refs;
+	volatile long weak_refs;
+};
+
+struct obs_weak_object {
+	struct obs_weak_ref ref;
+	struct obs_context_data *object;
+};
+
+typedef void (*obs_destroy_cb)(void *obj);
+
 struct obs_context_data {
 	char *name;
 	void *data;
@@ -491,6 +516,9 @@ struct obs_context_data {
 	signal_handler_t *signals;
 	proc_handler_t *procs;
 	enum obs_obj_type type;
+
+	struct obs_weak_object *control;
+	obs_destroy_cb destroy;
 
 	DARRAY(obs_hotkey_id) hotkeys;
 	DARRAY(obs_hotkey_pair_id) hotkey_pairs;
@@ -510,6 +538,8 @@ extern bool obs_context_data_init(struct obs_context_data *context,
 				  enum obs_obj_type type, obs_data_t *settings,
 				  const char *name, obs_data_t *hotkey_data,
 				  bool private);
+extern void obs_context_init_control(struct obs_context_data *context,
+				     void *object, obs_destroy_cb destroy);
 extern void obs_context_data_free(struct obs_context_data *context);
 
 extern void obs_context_data_insert(struct obs_context_data *context,
@@ -522,11 +552,6 @@ extern void obs_context_data_setname(struct obs_context_data *context,
 
 /* ------------------------------------------------------------------------- */
 /* ref-counting  */
-
-struct obs_weak_ref {
-	volatile long refs;
-	volatile long weak_refs;
-};
 
 static inline void obs_ref_addref(struct obs_weak_ref *ref)
 {
@@ -610,7 +635,6 @@ struct caption_cb_info {
 struct obs_source {
 	struct obs_context_data context;
 	struct obs_source_info info;
-	struct obs_weak_source *control;
 
 	/* general exposed flags that can be set for the source */
 	uint32_t flags;
@@ -698,8 +722,10 @@ struct obs_source {
 	bool async_gpu_conversion;
 	enum video_format async_format;
 	bool async_full_range;
+	uint8_t async_trc;
 	enum video_format async_cache_format;
 	bool async_cache_full_range;
+	uint8_t async_cache_trc;
 	enum gs_color_format async_texture_formats[MAX_AV_PLANES];
 	int async_channel_count;
 	long async_rotation;
@@ -743,6 +769,7 @@ struct obs_source {
 	gs_texrender_t *filter_texrender;
 	enum obs_allow_direct_render allow_direct;
 	bool rendering_filter;
+	bool filter_bypass_active;
 
 	/* sources specific hotkeys */
 	obs_hotkey_pair_id mute_unmute_key;
@@ -784,6 +811,9 @@ struct obs_source {
 	enum obs_transition_scale_type transition_scale_type;
 	struct matrix4 transition_matrices[2];
 
+	/* color space */
+	gs_texrender_t *color_space_texrender;
+
 	struct audio_monitor *monitor;
 	enum obs_monitoring_type monitoring_type;
 
@@ -810,11 +840,10 @@ struct audio_monitor *audio_monitor_create(obs_source_t *source);
 void audio_monitor_reset(struct audio_monitor *monitor);
 extern void audio_monitor_destroy(struct audio_monitor *monitor);
 
-extern obs_source_t *obs_source_create_set_last_ver(const char *id,
-						    const char *name,
-						    obs_data_t *settings,
-						    obs_data_t *hotkey_data,
-						    uint32_t last_obs_ver);
+extern obs_source_t *
+obs_source_create_set_last_ver(const char *id, const char *name,
+			       obs_data_t *settings, obs_data_t *hotkey_data,
+			       uint32_t last_obs_ver, bool is_private);
 extern void obs_source_destroy(struct obs_source *source);
 
 enum view_type {
@@ -861,9 +890,24 @@ convert_video_format(enum video_format format)
 	case VIDEO_FORMAT_YUVA:
 	case VIDEO_FORMAT_AYUV:
 		return GS_BGRA;
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+		return GS_RGBA16F;
 	default:
 		return GS_BGRX;
 	}
+}
+
+static inline enum gs_color_space convert_video_space(enum video_format format,
+						      enum video_trc trc)
+{
+	enum gs_color_space space = GS_CS_SRGB;
+	if (convert_video_format(format) == GS_RGBA16F) {
+		space = (trc == VIDEO_TRC_SRGB) ? GS_CS_SRGB_16F
+						: GS_CS_709_EXTENDED;
+	}
+
+	return space;
 }
 
 extern void obs_source_set_texcoords_centered(obs_source_t *source,
@@ -946,7 +990,6 @@ extern void pause_reset(struct pause_data *pause);
 struct obs_output {
 	struct obs_context_data context;
 	struct obs_output_info info;
-	struct obs_weak_output *control;
 
 	/* indicates ownership of the info.id buffer */
 	bool owns_info_id;
@@ -1076,7 +1119,6 @@ struct encoder_callback {
 struct obs_encoder {
 	struct obs_context_data context;
 	struct obs_encoder_info info;
-	struct obs_weak_encoder *control;
 
 	/* allows re-routing to another encoder */
 	struct obs_encoder_info orig_info;
@@ -1180,7 +1222,6 @@ struct obs_weak_service {
 struct obs_service {
 	struct obs_context_data context;
 	struct obs_service_info info;
-	struct obs_weak_service *control;
 
 	/* indicates ownership of the info.id buffer */
 	bool owns_info_id;

@@ -33,13 +33,13 @@
 
 #include <QFile>
 #include <QGuiApplication>
-#include <QProxyStyle>
 #include <QScreen>
 #include <QProcess>
 #include <QAccessible>
 
 #include "qt-wrappers.hpp"
 #include "obs-app.hpp"
+#include "obs-proxy-style.hpp"
 #include "log-viewer.hpp"
 #include "slider-ignorewheel.hpp"
 #include "window-basic-main.hpp"
@@ -389,20 +389,23 @@ static void do_log(int log_level, const char *msg, va_list args, void *param)
 			OutputDebugStringW(wide_buf.c_str());
 		}
 	}
-#else
-	def_log_handler(log_level, msg, args2, nullptr);
-	va_end(args2);
 #endif
 
 	if (log_level <= LOG_INFO || log_verbose) {
-		if (too_many_repeated_entries(logFile, msg, str))
-			return;
-		LogStringChunk(logFile, str, log_level);
+#ifndef _WIN32
+		def_log_handler(log_level, msg, args2, nullptr);
+#endif
+		if (!too_many_repeated_entries(logFile, msg, str))
+			LogStringChunk(logFile, str, log_level);
 	}
 
 #if defined(_WIN32) && defined(OBS_DEBUGBREAK_ON_ERROR)
 	if (log_level <= LOG_ERROR && IsDebuggerPresent())
 		__debugbreak();
+#endif
+
+#ifndef _WIN32
+	va_end(args2);
 #endif
 }
 
@@ -1117,6 +1120,7 @@ bool OBSApp::SetTheme(std::string name, std::string path)
 	QString mpath = QString("file:///") + path.c_str();
 	setPalette(defaultPalette);
 	ParseExtraThemeData(path.c_str());
+	setStyle(new OBSIgnoreWheelProxyStyle);
 	setStyleSheet(mpath);
 	QColor color = palette().text().color();
 	themeDarkMode = !(color.redF() < 0.5);
@@ -1156,12 +1160,15 @@ bool OBSApp::InitTheme()
 OBSApp::OBSApp(int &argc, char **argv, profiler_name_store_t *store)
 	: QApplication(argc, argv), profilerNameStore(store)
 {
+	/* fix float handling */
+#if defined(Q_OS_UNIX)
+	if (!setlocale(LC_NUMERIC, "C"))
+		blog(LOG_WARNING, "Failed to set LC_NUMERIC to C locale");
+#endif
+
 	sleepInhibitor = os_inhibit_sleep_create("OBS Video/audio");
 
-#ifdef __APPLE__
-	setWindowIcon(
-		QIcon::fromTheme("obs", QIcon(":/res/images/obs_256x256.png")));
-#else
+#ifndef __APPLE__
 	setWindowIcon(QIcon::fromTheme("obs", QIcon(":/res/images/obs.png")));
 #endif
 
@@ -1178,11 +1185,11 @@ OBSApp::~OBSApp()
 #endif
 
 #ifdef __APPLE__
-	bool vsyncDiabled =
+	bool vsyncDisabled =
 		config_get_bool(globalConfig, "Video", "DisableOSXVSync");
 	bool resetVSync =
 		config_get_bool(globalConfig, "Video", "ResetOSXVSyncOnExit");
-	if (vsyncDiabled && resetVSync)
+	if (vsyncDisabled && resetVSync)
 		EnableOSXVSync(true);
 #endif
 
@@ -1278,8 +1285,6 @@ void OBSApp::AppInit()
 {
 	ProfileScope("OBSApp::AppInit");
 
-	if (!InitApplicationBundle())
-		throw "Failed to initialize application bundle";
 	if (!MakeUserDirs())
 		throw "Failed to create required user directories";
 	if (!InitGlobalConfig())
@@ -1455,6 +1460,12 @@ bool OBSApp::OBSInit()
 	blog(LOG_INFO, "Browser Hardware Acceleration: %s",
 	     browserHWAccel ? "true" : "false");
 #endif
+#ifdef _WIN32
+	bool hideFromCapture = config_get_bool(globalConfig, "BasicWindow",
+					       "HideOBSWindowsFromCapture");
+	blog(LOG_INFO, "Hide OBS windows from screen capture: %s",
+	     hideFromCapture ? "true" : "false");
+#endif
 
 	blog(LOG_INFO, "Qt Version: %s (runtime), %s (compiled)", qVersion(),
 	     QT_VERSION_STR);
@@ -1569,6 +1580,44 @@ bool OBSApp::TranslateString(const char *lookupVal, const char **out) const
 	}
 
 	return text_lookup_getstr(App()->GetTextLookup(), lookupVal, out);
+}
+
+// Global handler to receive all QEvent::Show events so we can apply
+// display affinity on any newly created windows and dialogs without
+// caring where they are coming from (e.g. plugins).
+bool OBSApp::notify(QObject *receiver, QEvent *e)
+{
+	QWidget *w;
+	QWindow *window;
+	int windowType;
+
+	if (!receiver->isWidgetType())
+		goto skip;
+
+	if (e->type() != QEvent::Show)
+		goto skip;
+
+	w = qobject_cast<QWidget *>(receiver);
+
+	if (!w->isWindow())
+		goto skip;
+
+	window = w->windowHandle();
+	if (!window)
+		goto skip;
+
+	windowType = window->flags() & Qt::WindowType::WindowType_Mask;
+
+	if (windowType == Qt::WindowType::Dialog ||
+	    windowType == Qt::WindowType::Window ||
+	    windowType == Qt::WindowType::Tool) {
+		OBSBasic *main = reinterpret_cast<OBSBasic *>(GetMainWindow());
+		if (main)
+			main->SetDisplayAffinity(window);
+	}
+
+skip:
+	return QApplication::notify(receiver, e);
 }
 
 QString OBSTranslator::translate(const char *context, const char *sourceText,
@@ -2017,6 +2066,12 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 
 #if __APPLE__
 	InstallNSApplicationSubclass();
+
+	if (!isInBundle()) {
+		blog(LOG_ERROR,
+		     "OBS cannot be run as a standalone binary on macOS. Run the Application bundle instead.");
+		return ret;
+	}
 #endif
 
 #if !defined(_WIN32) && !defined(__APPLE__) && defined(USE_XDG) && \
@@ -2049,15 +2104,10 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 		bool cancel_launch = false;
 		bool already_running = false;
 
-#if defined(_WIN32)
-		RunOnceMutex rom = GetRunOnceMutex(already_running);
-#elif defined(__APPLE__)
-		CheckAppWithSameBundleID(already_running);
-#elif defined(__linux__)
-		RunningInstanceCheck(already_running);
-#elif defined(__FreeBSD__) || defined(__DragonFly__)
-		PIDFileCheck(already_running);
+#ifdef _WIN32
+		RunOnceMutex rom =
 #endif
+			CheckIfAlreadyRunning(already_running);
 
 		if (!already_running) {
 			goto run;
@@ -2118,16 +2168,33 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 		}
 #endif
 
+		if (!created_log) {
+			create_log_file(logFile);
+			created_log = true;
+		}
+
 #ifdef __APPLE__
 		bool rosettaTranslated = ProcessIsRosettaTranslated();
 		blog(LOG_INFO, "Rosetta translation used: %s",
 		     rosettaTranslated ? "true" : "false");
 #endif
 
-		if (!created_log) {
-			create_log_file(logFile);
-			created_log = true;
+#ifdef _WIN32
+		if (IsRunningOnWine()) {
+			QMessageBox mb(QMessageBox::Question,
+				       QTStr("Wine.Title"), QTStr("Wine.Text"));
+			mb.setTextFormat(Qt::RichText);
+			mb.addButton(QTStr("AlreadyRunning.LaunchAnyway"),
+				     QMessageBox::AcceptRole);
+			QPushButton *closeButton =
+				mb.addButton(QMessageBox::Close);
+			mb.setDefaultButton(closeButton);
+
+			mb.exec();
+			if (mb.clickedButton() == closeButton)
+				return 0;
 		}
+#endif
 
 		if (argc > 1) {
 			stringstream stor;
@@ -2280,13 +2347,13 @@ static void load_debug_privilege(void)
 
 #define CONFIG_PATH BASE_PATH "/config"
 
-#ifndef OBS_UNIX_STRUCTURE
-#define OBS_UNIX_STRUCTURE 0
+#ifndef LINUX_PORTABLE
+#define LINUX_PORTABLE 0
 #endif
 
 int GetConfigPath(char *path, size_t size, const char *name)
 {
-	if (!OBS_UNIX_STRUCTURE && portable_mode) {
+	if (LINUX_PORTABLE && portable_mode) {
 		if (name && *name) {
 			return snprintf(path, size, CONFIG_PATH "/%s", name);
 		} else {
@@ -2299,7 +2366,7 @@ int GetConfigPath(char *path, size_t size, const char *name)
 
 char *GetConfigPathPtr(const char *name)
 {
-	if (!OBS_UNIX_STRUCTURE && portable_mode) {
+	if (LINUX_PORTABLE && portable_mode) {
 		char path[512];
 
 		if (snprintf(path, sizeof(path), CONFIG_PATH "/%s", name) > 0) {
@@ -2811,7 +2878,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-#if !OBS_UNIX_STRUCTURE
+#if defined(LINUX_PORTABLE)
 	if (!portable_mode) {
 		portable_mode =
 			os_file_exists(BASE_PATH "/portable_mode") ||

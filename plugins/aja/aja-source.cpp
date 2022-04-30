@@ -7,11 +7,13 @@
 #include <util/threading.h>
 #include <util/platform.h>
 #include <util/dstr.h>
+#include <util/util_uint64.h>
 #include <obs-module.h>
 
 #include <ajantv2/includes/ntv2card.h>
 #include <ajantv2/includes/ntv2utils.h>
 
+#define NSEC_PER_SEC 1000000000LL
 #define NTV2_AUDIOSIZE_MAX (401 * 1024)
 
 AJASource::AJASource(obs_source_t *source)
@@ -27,7 +29,8 @@ AJASource::AJASource(obs_source_t *source)
 	  mTestPattern{},
 	  mCaptureThread{nullptr},
 	  mMutex{},
-	  mSource{source}
+	  mSource{source},
+	  mCrosspoints{}
 {
 }
 
@@ -148,20 +151,37 @@ void AJASource::GenerateTestPattern(NTV2VideoFormat vf, NTV2PixelFormat pf,
 		return;
 	}
 
+	const enum video_format obs_vid_fmt =
+		aja::AJAPixelFormatToOBSVideoFormat(pix_fmt);
+
 	struct obs_source_frame2 obsFrame;
 	obsFrame.flip = false;
 	obsFrame.timestamp = os_gettime_ns();
 	obsFrame.width = fd.GetRasterWidth();
 	obsFrame.height = fd.GetRasterHeight();
-	obsFrame.format = aja::AJAPixelFormatToOBSVideoFormat(pix_fmt);
+	obsFrame.format = obs_vid_fmt;
 	obsFrame.data[0] = mTestPattern.data();
 	obsFrame.linesize[0] = fd.GetBytesPerRow();
-	video_format_get_parameters(VIDEO_CS_DEFAULT, VIDEO_RANGE_FULL,
-				    obsFrame.color_matrix,
-				    obsFrame.color_range_min,
-				    obsFrame.color_range_max);
+	video_colorspace colorspace = VIDEO_CS_709;
+	if (NTV2_IS_SD_VIDEO_FORMAT(vid_fmt))
+		colorspace = VIDEO_CS_601;
+	video_format_get_parameters_for_format(colorspace, VIDEO_RANGE_PARTIAL,
+					       obs_vid_fmt,
+					       obsFrame.color_matrix,
+					       obsFrame.color_range_min,
+					       obsFrame.color_range_max);
 	obs_source_output_video2(mSource, &obsFrame);
 	blog(LOG_DEBUG, "AJASource::GenerateTestPattern: Black");
+}
+
+static inline uint64_t samples_to_ns(size_t frames, uint_fast32_t rate)
+{
+	return util_mul_div64(frames, NSEC_PER_SEC, rate);
+}
+
+static inline uint64_t get_sample_time(size_t frames, uint_fast32_t rate)
+{
+	return os_gettime_ns() - samples_to_ns(frames, rate);
 }
 
 void AJASource::CaptureThread(AJAThread *thread, void *data)
@@ -329,7 +349,8 @@ void AJASource::CaptureThread(AJAThread *thread, void *data)
 			audioPacket.format = AUDIO_FORMAT_32BIT;
 			audioPacket.speakers = SPEAKERS_7POINT1;
 			audioPacket.frames = offsets.bytesRead / 32;
-			audioPacket.timestamp = os_gettime_ns();
+			audioPacket.timestamp =
+				get_sample_time(audioPacket.frames, 48000);
 			audioPacket.data[0] = (uint8_t *)ajaSource->mAudioBuffer
 						      .GetHostPointer();
 			obs_source_output_audio(ajaSource->mSource,
@@ -350,22 +371,27 @@ void AJASource::CaptureThread(AJAThread *thread, void *data)
 			actualVideoFormat = aja::GetLevelAFormatForLevelBFormat(
 				videoFormat);
 
+		const enum video_format obs_vid_fmt =
+			aja::AJAPixelFormatToOBSVideoFormat(
+				sourceProps.pixelFormat);
+
 		NTV2FormatDesc fd(actualVideoFormat, pixelFormat);
 		struct obs_source_frame2 obsFrame;
 		obsFrame.flip = false;
 		obsFrame.timestamp = os_gettime_ns();
 		obsFrame.width = fd.GetRasterWidth();
 		obsFrame.height = fd.GetRasterHeight();
-		obsFrame.format = aja::AJAPixelFormatToOBSVideoFormat(
-			sourceProps.pixelFormat);
+		obsFrame.format = obs_vid_fmt;
 		obsFrame.data[0] = reinterpret_cast<uint8_t *>(
 			(ULWord *)ajaSource->mVideoBuffer.GetHostPointer());
 		obsFrame.linesize[0] = fd.GetBytesPerRow();
-
-		video_format_get_parameters(VIDEO_CS_DEFAULT, VIDEO_RANGE_FULL,
-					    obsFrame.color_matrix,
-					    obsFrame.color_range_min,
-					    obsFrame.color_range_max);
+		video_colorspace colorspace = VIDEO_CS_709;
+		if (NTV2_IS_SD_VIDEO_FORMAT(actualVideoFormat))
+			colorspace = VIDEO_CS_601;
+		video_format_get_parameters_for_format(
+			colorspace, VIDEO_RANGE_PARTIAL, obs_vid_fmt,
+			obsFrame.color_matrix, obsFrame.color_range_min,
+			obsFrame.color_range_max);
 
 		obs_source_output_video2(ajaSource->mSource, &obsFrame);
 
@@ -456,6 +482,20 @@ void AJASource::SetSourceProps(const SourceProps &props)
 SourceProps AJASource::GetSourceProps() const
 {
 	return mSourceProps;
+}
+
+void AJASource::CacheConnections(const NTV2XptConnections &cnx)
+{
+	mCrosspoints.clear();
+	mCrosspoints = cnx;
+}
+
+void AJASource::ClearConnections()
+{
+	for (auto &&xpt : mCrosspoints) {
+		mCard->Connect(xpt.first, NTV2_XptBlack);
+	}
+	mCrosspoints.clear();
 }
 
 bool AJASource::ReadChannelVPIDs(NTV2Channel channel, VPIDData &vpids)
@@ -650,7 +690,8 @@ bool aja_source_device_changed(void *data, obs_properties_t *props,
 	obs_property_list_clear(vid_fmt_list);
 	obs_property_list_add_int(vid_fmt_list, obs_module_text("Auto"),
 				  kAutoDetect);
-	populate_video_format_list(deviceID, vid_fmt_list, videoFormatChannel1);
+	populate_video_format_list(deviceID, vid_fmt_list, videoFormatChannel1,
+				   true);
 
 	obs_property_list_clear(pix_fmt_list);
 	obs_property_list_add_int(pix_fmt_list, obs_module_text("Auto"),
@@ -660,9 +701,7 @@ bool aja_source_device_changed(void *data, obs_properties_t *props,
 	IOSelection io_select = static_cast<IOSelection>(
 		obs_data_get_int(settings, kUIPropInput.id));
 	obs_property_list_clear(sdi_trx_list);
-	obs_property_list_add_int(sdi_trx_list, obs_module_text("Auto"),
-				  kAutoDetect);
-	populate_sdi_transport_list(sdi_trx_list, io_select);
+	populate_sdi_transport_list(sdi_trx_list, io_select, deviceID, true);
 
 	obs_property_list_clear(sdi_4k_list);
 	populate_sdi_4k_transport_list(sdi_4k_list);
@@ -678,6 +717,8 @@ bool aja_source_device_changed(void *data, obs_properties_t *props,
 	obs_property_set_visible(io_select_list, have_cards);
 	obs_property_set_visible(vid_fmt_list, have_cards);
 	obs_property_set_visible(pix_fmt_list, have_cards);
+	obs_property_set_visible(
+		sdi_trx_list, have_cards && aja::IsIOSelectionSDI(io_select));
 	obs_property_set_visible(
 		sdi_4k_list, have_cards && NTV2_IS_4K_VIDEO_FORMAT(curr_vf));
 
@@ -709,11 +750,13 @@ bool aja_io_selection_changed(void *data, obs_properties_t *props,
 		return false;
 	}
 
-	obs_property_t *io_select_list =
-		obs_properties_get(props, kUIPropInput.id);
-
 	filter_io_selection_input_list(cardID, ajaSource->GetName(),
-				       io_select_list);
+				       obs_properties_get(props,
+							  kUIPropInput.id));
+	obs_property_set_visible(
+		obs_properties_get(props, kUIPropSDITransport.id),
+		aja::IsIOSelectionSDI(static_cast<IOSelection>(
+			obs_data_get_int(settings, kUIPropInput.id))));
 
 	return true;
 }
@@ -948,19 +991,14 @@ static void aja_source_update(void *data, obs_data_t *settings)
 	want_props.sdi4kTransport = sdi_t4k_select;
 	want_props.vpids.clear();
 	want_props.deactivateWhileNotShowing = deactivateWhileNotShowing;
-	want_props.autoDetect = ((int32_t)vf_select == kAutoDetect ||
-				 (int32_t)pf_select == kAutoDetect);
+	if (aja::IsIOSelectionSDI(io_select)) {
+		want_props.autoDetect = (int)sdi_trx_select == kAutoDetect;
+	} else {
+		want_props.autoDetect = ((int)vf_select == kAutoDetect ||
+					 (int)pf_select == kAutoDetect);
+	}
 	ajaSource->SetCardID(wantCardID);
 	ajaSource->SetDeviceIndex((UWord)cardEntry->GetCardIndex());
-
-	if (NTV2_IS_4K_VIDEO_FORMAT(want_props.videoFormat) &&
-	    want_props.sdi4kTransport == SDITransport4K::Squares) {
-		if (want_props.ioSelect == IOSelection::SDI1_2) {
-			want_props.ioSelect = IOSelection::SDI1_2_Squares;
-		} else if (want_props.ioSelect == IOSelection::SDI3_4) {
-			want_props.ioSelect = IOSelection::SDI3_4_Squares;
-		}
-	}
 
 	// Release Channels if IOSelection changes
 	if (want_props.ioSelect != curr_props.ioSelect) {
@@ -1023,8 +1061,11 @@ static void aja_source_update(void *data, obs_data_t *settings)
 
 	// Change capture format and restart capture thread
 	if (!initialized || want_props != ajaSource->GetSourceProps()) {
-		aja::Routing::ConfigureSourceRoute(want_props,
-						   NTV2_MODE_CAPTURE, card);
+		ajaSource->ClearConnections();
+		NTV2XptConnections xpt_cnx;
+		aja::Routing::ConfigureSourceRoute(
+			want_props, NTV2_MODE_CAPTURE, card, xpt_cnx);
+		ajaSource->CacheConnections(xpt_cnx);
 		ajaSource->Deactivate();
 		initialized = true;
 	}
